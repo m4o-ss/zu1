@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Три разноцветных шарика как иконка игры -->
+    <path
+        android:fillColor="#FFFF5252"
+        android:pathData="M42,44m-14,0a14,14 0,1 1,28 0a14,14 0,1 1,-28 0"/>
+    <path
+        android:fillColor="#FFFFEB3B"
+        android:pathData="M66,52m-12,0a12,12 0,1 1,24 0a12,12 0,1 1,-24 0"/>
+    <path
+        android:fillColor="#FF4CAF50"
+        android:pathData="M50,68m-11,0a11,11 0,1 1,22 0a11,11 0,1 1,-22 0"/>
+    <path
+        android:fillColor="#33FFFFFF"
+        android:pathData="M37,39m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0"/>
+</vector>
