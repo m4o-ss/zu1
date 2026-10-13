@@ -13,6 +13,8 @@ import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 
+import java.util.concurrent.ThreadLocalRandom;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -61,7 +63,6 @@ public class GameView extends SurfaceView implements Runnable {
     private float cannonAngle = -((float) Math.PI / 2f);
     private int nextColor = 0;
     private int currentColor = 0;
-    private boolean swapRequested = false;
 
     // Игровая статистика
     private int level = 1;
@@ -69,6 +70,7 @@ public class GameView extends SurfaceView implements Runnable {
     private long highScore = 0;
     private int lives = 3;
     private int ballsToSpawn;
+    private int colorsUsed = 4;             // сколько цветов задействовано на уровне
     private float spawnTimer = 0f;
     private float chainSpeed;              // px/сек скорость движения цепочки
     private float spawnGap;                // дистанция между шариками при появлении
@@ -80,7 +82,12 @@ public class GameView extends SurfaceView implements Runnable {
     // Отрисовка
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Random random = new Random();
+    /** Потокобезопасный источник случайных чисел (logika + выстрелы из разных потоков). */
+    private static final class SafeRandom extends Random {
+        @Override public synchronized int nextInt(int bound) { return super.nextInt(bound); }
+        @Override public synchronized float nextFloat() { return super.nextFloat(); }
+    }
+    private final Random random = new SafeRandom();
     private SoundManager sound;
 
     private long lastFrameNs = 0;
@@ -88,7 +95,7 @@ public class GameView extends SurfaceView implements Runnable {
     /** Шарик в цепочке. dist — положение вдоль пути (px от начала). */
     private static class Ball {
         float dist;
-        int color;
+        int color;      // индекс в BALL_COLORS
         final PointF pos = new PointF();
         float wobble = 0f; // небольшой "дышащий" эффект при комбо
         Ball(float dist, int color) {
@@ -163,7 +170,8 @@ public class GameView extends SurfaceView implements Runnable {
 
     /** Возобновление после сворачивания: если игра была на паузе и поверхность снова готова — ждём тапа. */
     public void resumeGame() {
-        // состояние остаётся STATE_PAUSED, тап по экрану продолжит игру
+        // сбрасываем таймер кадра, чтобы после возврата не было скачка dt
+        lastFrameNs = System.nanoTime();
     }
 
     // =====================================================================
@@ -194,7 +202,7 @@ public class GameView extends SurfaceView implements Runnable {
         effects.clear();
 
         ballsToSpawn = 28 + lvl * 8;
-        int colorsUsed = Math.min(BALL_COLORS.length, 3 + lvl / 2);
+        colorsUsed = Math.min(BALL_COLORS.length, 3 + lvl / 2);
         chainSpeed = (Math.min(width, height)) * (0.055f + lvl * 0.012f); // px/сек
         spawnGap = ballRadius * 2.05f;
 
@@ -226,20 +234,13 @@ public class GameView extends SurfaceView implements Runnable {
     private int pickColorFromChain(int colorsUsed) {
         if (!chain.isEmpty()) {
             Ball b = chain.get(random.nextInt(chain.size()));
-            return colorIndex(b.color);
+            return b.color;
         }
         return random.nextInt(Math.min(BALL_COLORS.length, colorsUsed));
     }
 
-    private int colorIndex(int rgb) {
-        for (int i = 0; i < BALL_COLORS.length; i++) {
-            if (BALL_COLORS[i] == rgb) return i;
-        }
-        return 0;
-    }
-
     private int colorsInUse() {
-        return Math.min(BALL_COLORS.length, 3 + level / 2);
+        return Math.min(BALL_COLORS.length, colorsUsed);
     }
 
     // =====================================================================
@@ -253,23 +254,25 @@ public class GameView extends SurfaceView implements Runnable {
                 float dt = Math.min(0.05f, (now - lastFrameNs) / 1_000_000_000f);
                 lastFrameNs = now;
 
-                if (state == STATE_PLAYING) {
-                    update(dt);
-                }
-
                 Canvas canvas = null;
                 synchronized (getHolder()) {
                     if (!getHolder().getSurface().isValid()) {
                         try { Thread.sleep(30); } catch (InterruptedException ignored) {}
                         continue;
                     }
-                    canvas = getHolder().lockCanvas();
+                    // lockCanvas(null): корректная двойная буферизация —
+                    // без "шлейфов" за прицельной линией и без мерцания экрана.
+                    canvas = getHolder().lockCanvas(null);
                 }
                 if (canvas != null) {
-                    synchronized (getHolder()) {
-                        draw(canvas, dt);
-                    }
+                    // Сначала пересчитываем экранные позиции шариков (внутри draw),
+                    // затем физика/коллизии — так снаряд никогда не "пролетает"
+                    // сквозь шарики из-за устаревших координат.
+                    draw(canvas, dt);
                     getHolder().unlockCanvasAndPost(canvas);
+                }
+                if (state == STATE_PLAYING) {
+                    update(dt);
                 }
 
                 try { Thread.sleep(10); } catch (InterruptedException ignored) {}
@@ -282,7 +285,10 @@ public class GameView extends SurfaceView implements Runnable {
     // =====================================================================
     //  Логика обновления
     // =====================================================================
+    /** Вспомогательная точка для потока отрисовки. */
     private final PointF tmpPoint = new PointF();
+    /** Вспомогательная точка для игрового потока (logика/коллизии). */
+    private final PointF logicPoint = new PointF();
 
     private void update(float dt) {
         GamePath gp = gamePath; // volatile-снимок: защита от гонки с пересборкой геометрии
@@ -296,23 +302,20 @@ public class GameView extends SurfaceView implements Runnable {
             if (Float.isNaN(b.dist) || Float.isInfinite(b.dist)) b.dist = 0f;
         }
 
-        // Выпуск новых шариков с хвоста (отрицательный dist -> въезжают за краем)
-        if (ballsToSpawn > 0) {
+        // Выпуск новых шариков с хвоста: они появляются ЗА левым краем экрана
+        // (на экстраполяции входа) и въезжают на трассу, как в оригинальной Zuma.
+        if (ballsToSpawn > 0 && chain.size() < 200) {
             spawnTimer -= dt;
-            if (spawnTimer <= 0f && chain.size() < 200) {
-                // расстояние за началом пути, где появляется новый шарик
-                float tailDist = chain.isEmpty() ? 0f : chain.get(chain.size() - 1).dist;
-                if (tailDist >= -spawnGap || chain.isEmpty()) {
-                    Ball newest = chain.isEmpty() ? null : chain.get(chain.size() - 1);
-                    float nd = newest == null ? -ballRadius * 2f
-                            : Math.min(newest.dist - spawnGap, -ballRadius * 2f);
-                    // гарантируем, что новый шарик не "перескакивает" предыдущий
-                    chain.add(new Ball(nd, random.nextInt(colorsInUse())));
-                    ballsToSpawn--;
-                    spawnTimer = 0.12f;
-                } else {
-                    spawnTimer = 0.05f;
-                }
+            if (spawnTimer <= 0f) {
+                Ball newest = chain.isEmpty() ? null : chain.get(chain.size() - 1);
+                // dist точки появления: за последним шариком на spawnGap,
+                // но не ближе -ballRadius*2 к началу трассы (иначе шарик уже виден)
+                float nd = (newest == null)
+                        ? -ballRadius * 6f
+                        : Math.min(newest.dist - spawnGap, -ballRadius * 2f);
+                chain.add(new Ball(nd, pickColorFromChain(colorsUsed)));
+                ballsToSpawn--;
+                spawnTimer = 0.12f;
             }
         }
 
@@ -386,28 +389,28 @@ public class GameView extends SurfaceView implements Runnable {
         // касательная пути в точке шарика
         GamePath gpI = gamePath;
         if (gpI == null) return;
-        gpI.getPoint(hit.dist - 1f, tmpPoint);
+        gpI.getPoint(hit.dist - 1f, logicPoint);
         float tx = hit.pos.x - tmpPoint.x, ty = hit.pos.y - tmpPoint.y;
         float dot = dx * tx + dy * ty;
         int idx = dot >= 0 ? hitIdx + 1 : hitIdx;
 
         float newDist;
         if (idx <= 0) {
-            // вставка перед головой цепочки — сдвигаем всю цепочку назад,
-            // чтобы новый шарик не наложился на существующие
+            // вставка перед головой цепочки: сдвигаем ВСЮ цепочку вперёд (к норе),
+            // а новый шарик ставим на освободившуюся позицию впереди головы.
+            // (сдвиг назад недопустим — голова не должна уезжать за начало трассы)
+            newDist = hit.dist;
             for (Ball b : chain) b.dist += spawnGap;
-            newDist = chain.isEmpty() ? hit.dist + spawnGap : chain.get(0).dist - spawnGap;
         } else if (idx >= chain.size()) {
-            newDist = chain.get(chain.size() - 1).dist - spawnGap;
+            newDist = chain.get(chain.size() - 1).dist + spawnGap;
         } else {
-            // вставляем между idx-1 и idx: сдвигаем всё, начиная с idx, назад
-            newDist = chain.get(idx - 1).dist - spawnGap;
+            // вставляем между idx-1 и idx: сдвигаем хвост (начиная с idx) назад
+            newDist = chain.get(idx - 1).dist + spawnGap;
+            for (int i = idx; i < chain.size(); i++) {
+                chain.get(i).dist -= spawnGap;
+            }
         }
-        // сдвинуть хвост (начиная с idx) на spawnGap назад, чтобы избежать наложений
-        for (int i = idx; i < chain.size(); i++) {
-            chain.get(i).dist -= spawnGap;
-        }
-        chain.add(idx, new Ball(newDist, BALL_COLORS[p.color]));
+        chain.add(idx, new Ball(newDist, p.color));
 
         // толчок: немного разогнать/затормозить цепочку вокруг точки вставки (эффект "пробуксовки")
         for (int i = Math.max(0, idx - 3); i < Math.min(chain.size(), idx + 4); i++) {
@@ -461,7 +464,7 @@ public class GameView extends SurfaceView implements Runnable {
             Ball b = chain.get(i);
             Effect e = new Effect();
             e.x = b.pos.x; e.y = b.pos.y; e.t = 0f;
-            e.color = b.color; e.r = ballRadius;
+            e.color = BALL_COLORS[b.color]; e.r = ballRadius;
             effects.add(e);
         }
         for (int i = right; i >= left; i--) chain.remove(i);
@@ -524,8 +527,9 @@ public class GameView extends SurfaceView implements Runnable {
 
         float sx = 0, sy = 0;
         if (shakeTime > 0) {
-            sx = (random.nextFloat() - 0.5f) * 14f;
-            sy = (random.nextFloat() - 0.5f) * 14f;
+            ThreadLocalRandom shakeRng = ThreadLocalRandom.current();
+            sx = (shakeRng.nextFloat() - 0.5f) * 14f;
+            sy = (shakeRng.nextFloat() - 0.5f) * 14f;
         }
         canvas.save();
         canvas.translate(sx, sy);
@@ -555,7 +559,7 @@ public class GameView extends SurfaceView implements Runnable {
         for (int i = chain.size() - 1; i >= 0; i--) {
             Ball b = chain.get(i);
             if (b.dist < -ballRadius * 4f) continue; // ещё не виден
-            drawBall(canvas, b.pos.x, b.pos.y, ballRadius, b.color);
+            drawBall(canvas, b.pos.x, b.pos.y, ballRadius, BALL_COLORS[b.color]);
         }
 
         // Снаряды
@@ -804,7 +808,7 @@ public class GameView extends SurfaceView implements Runnable {
         projectiles.add(p);
 
         currentColor = nextColor;
-        nextColor = random.nextInt(colorsInUse());
+        nextColor = pickColorFromChain(colorsUsed);
         sound.playShoot();
     }
 

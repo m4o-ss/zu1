@@ -49,6 +49,29 @@ public class GamePath {
                     a * y0 + b * cy1 + c * cy2 + d * y1);
         }
 
+        /** Касательная (единичная) в точке на доле len от начала сегмента. */
+        void tangentAtLength(float dist, PointF out) {
+            float t;
+            if (dist <= 0) t = 0f;
+            else if (dist >= length) t = 1f;
+            else {
+                int lo = 0, hi = LOOKUP;
+                while (lo < hi - 1) {
+                    int mid = (lo + hi) >>> 1;
+                    if (tTable[mid] <= dist) lo = mid; else hi = mid;
+                }
+                float segLen = tTable[hi] - tTable[lo];
+                float f = segLen > 0 ? (dist - tTable[lo]) / segLen : 0f;
+                t = (lo + f) / LOOKUP;
+            }
+            float mt = 1f - t;
+            float dx = 3 * mt * mt * (cx1 - x0) + 6 * mt * t * (cx2 - cx1) + 3 * t * t * (x1 - cx2);
+            float dy = 3 * mt * mt * (cy1 - y0) + 6 * mt * t * (cy2 - cy1) + 3 * t * t * (y1 - cy2);
+            float len = (float) Math.hypot(dx, dy);
+            if (len < 1e-6f) { out.set(1f, 0f); return; }
+            out.set(dx / len, dy / len);
+        }
+
         /** Возвращает точку на доле len/length от начала сегмента. */
         PointF atLength(float dist) {
             if (dist <= 0) return new PointF(x0, y0);
@@ -67,26 +90,30 @@ public class GamePath {
     }
 
     private final Cubic[] segments;
+    private PointF entryTangent;
     private final float[] cumLengths;
     private float totalLength;
 
     public GamePath(float w, float h) {
         // Строим спираль: вход сверху, несколько витков внутрь, центр — "нора".
         // Точки заданы в нормализованных координатах (0..1), масштабируются под экран.
+        // ВАЖНО: трасса намеренно расположена ВЫШЕ пушки (y <= 0.74): нижняя зона
+        // экрана (0.74..1.0) полностью свободна, чтобы цепочка никогда не проходила
+        // через место вылета снарядов и игрок мог стрелять прицельно.
         float[][] pts = {
                 {-0.12f, 0.16f},   // старт за левым краем (отсюда въезжают шарики)
                 {0.50f, 0.08f},
                 {0.97f, 0.28f},
-                {0.90f, 0.78f},
-                {0.50f, 0.93f},
-                {0.12f, 0.74f},
+                {0.90f, 0.68f},
+                {0.50f, 0.74f},
+                {0.12f, 0.64f},
                 {0.16f, 0.36f},
                 {0.50f, 0.27f},
                 {0.80f, 0.45f},
-                {0.68f, 0.72f},
-                {0.40f, 0.70f},
-                {0.32f, 0.50f},
-                {0.50f, 0.47f},   // финал — нора в центре
+                {0.68f, 0.64f},
+                {0.40f, 0.62f},
+                {0.32f, 0.47f},
+                {0.50f, 0.44f},   // финал — нора в центре
         };
 
         // Гладкая замкнутая... не замкнутая: открытая кривая через точки
@@ -129,13 +156,19 @@ public class GamePath {
     /** Точка на расстоянии dist от начала пути. dist<0 — продолжение за стартом. */
     public void getPoint(float dist, PointF out) {
         if (dist <= 0f) {
-            // экстраполяция прямой по касательной в начале пути
+            // экстраполяция по касательной входа, но НЕ дальше левого края экрана —
+            // так новые шарики появляются за пределами видимой области и въезжают на трассу
             Cubic first = segments[0];
-            float ex = first.x0 - first.cx1;
-            float ey = first.y0 - first.cy1;
-            float len = (float) Math.hypot(ex, ey);
-            if (len < 0.001f) { ex = 1; ey = 0; len = 1; }
-            out.set(first.x0 + ex / len * (-dist), first.y0 + ey / len * (-dist));
+            if (entryTangent == null) entryTangent = new PointF();
+            first.tangentAtLength(0f, entryTangent);
+            float px = first.x0 - entryTangent.x * (-dist);
+            float py = first.y0 - entryTangent.y * (-dist);
+            if (px < -40f) {
+                float k = (first.x0 + 40f) / Math.max(entryTangent.x, 1e-4f);
+                px = first.x0 - entryTangent.x * k;
+                py = first.y0 - entryTangent.y * k;
+            }
+            out.set(px, py);
             return;
         }
         if (dist >= totalLength) {
