@@ -186,6 +186,25 @@ public class GamePath {
         out.set(p);
     }
 
+    /** Единичная касательная к пути в точке dist (направление движения цепочки). */
+    public void getTangent(float dist, PointF out) {
+        if (dist <= 0f) {
+            segments[0].tangentAtLength(0f, out);
+            return;
+        }
+        if (dist >= totalLength) {
+            segments[segments.length - 1].tangentAtLength(
+                    segments[segments.length - 1].length, out);
+            return;
+        }
+        int lo = 0, hi = segments.length - 1;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) >>> 1;
+            if (cumLengths[mid] <= dist) lo = mid; else hi = mid - 1;
+        }
+        segments[lo].tangentAtLength(dist - cumLengths[lo], out);
+    }
+
     /** Тот же путь в виде android.graphics.Path для отрисовки дорожки. */
     public android.graphics.Path buildGraphicsPath() {
         android.graphics.Path gp = new android.graphics.Path();
