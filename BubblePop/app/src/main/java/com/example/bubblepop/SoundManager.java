@@ -2,54 +2,75 @@ package com.example.bubblepop;
 
 import android.content.Context;
 import android.media.AudioAttributes;
+import android.media.AudioManager;
 import android.media.SoundPool;
-import android.os.Build;
 
 /**
  * Простые синтезированные звуки через ToneGenerator (без аудиофайлов):
  * выстрел, лопание шарика, комбо, конец уровня.
+ * Все вызовы обёрнуты в try/catch: на некоторых прошивках ToneGenerator /
+ * AudioManager могут бросать исключения — игра не должна из-за этого падать.
  */
 public class SoundManager {
 
-    private final SoundPool soundPool;
-    private final android.media.ToneGenerator tgTone;
-    private final android.media.ToneGenerator tgNoise;
+    private SoundPool soundPool;
+    private android.media.ToneGenerator tgTone;
+    private android.media.ToneGenerator tgNoise;
 
     public SoundManager(Context ctx) {
-        AudioAttributes aa = new AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_GAME)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .build();
-        soundPool = new SoundPool.Builder()
-                .setMaxStreams(8)
-                .setAudioAttributes(aa)
-                .build();
-        tgTone = new android.media.ToneGenerator(AudioAttributes.USAGE_GAME, 60);
-        tgNoise = new android.media.ToneGenerator(AudioAttributes.USAGE_GAME, 60);
+        try {
+            AudioAttributes aa = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_GAME)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build();
+            soundPool = new SoundPool.Builder()
+                    .setMaxStreams(8)
+                    .setAudioAttributes(aa)
+                    .build();
+            tgTone = new android.media.ToneGenerator(AudioManager.STREAM_MUSIC, 60);
+            tgNoise = new android.media.ToneGenerator(AudioManager.STREAM_MUSIC, 60);
+        } catch (Throwable t) {
+            // звук — не критично, играем без него
+            soundPool = null;
+            tgTone = null;
+            tgNoise = null;
+        }
     }
 
     public void playShoot() {
-        tgTone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 60);
+        try {
+            if (tgTone != null)
+                tgTone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 60);
+        } catch (Throwable ignored) {}
     }
 
     public void playPop(int comboLevel) {
-        // Чем больше комбо — тем выше тон
-        int tone = android.media.ToneGenerator.TONE_PROP_BEEP;
-        tgTone.startTone(tone, 40);
-        tgNoise.startTone(android.media.ToneGenerator.TONE_CDMA_ABBR_ALERT, 50);
+        try {
+            if (tgTone != null)
+                tgTone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 40);
+            if (tgNoise != null)
+                tgNoise.startTone(android.media.ToneGenerator.TONE_CDMA_ABBR_ALERT, 50);
+        } catch (Throwable ignored) {}
     }
 
     public void playChain() {
-        tgTone.startTone(android.media.ToneGenerator.TONE_DTMF_1, 80);
+        try {
+            if (tgTone != null)
+                tgTone.startTone(android.media.ToneGenerator.TONE_DTMF_1, 80);
+        } catch (Throwable ignored) {}
     }
 
     public void playGameOver() {
-        tgTone.startTone(android.media.ToneGenerator.TONE_PROP_NACK, 300);
+        try {
+            if (tgTone != null)
+                tgTone.startTone(android.media.ToneGenerator.TONE_PROP_NACK, 300);
+        } catch (Throwable ignored) {}
     }
 
     public void release() {
-        soundPool.release();
-        tgTone.release();
-        tgNoise.release();
+        try { if (soundPool != null) soundPool.release(); } catch (Throwable ignored) {}
+        try { if (tgTone != null) tgTone.release(); } catch (Throwable ignored) {}
+        try { if (tgNoise != null) tgNoise.release(); } catch (Throwable ignored) {}
+        soundPool = null; tgTone = null; tgNoise = null;
     }
 }

@@ -46,8 +46,8 @@ public class GameView extends SurfaceView implements Runnable {
 
     // Геометрия
     private float width, height;
-    private Path track;                    // визуальный путь (android.graphics.Path)
-    private GamePath gamePath;             // путь с равномерной параметризацией по длине
+    private volatile Path track;                    // визуальный путь (android.graphics.Path)
+    private volatile GamePath gamePath;             // путь с равномерной параметризацией по длине
     private float trackWidth;              // ширина "дорожки"
     private float ballRadius;
 
@@ -115,13 +115,31 @@ public class GameView extends SurfaceView implements Runnable {
         super(context);
         getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override public void surfaceCreated(SurfaceHolder holder) {
-                setRunning(true);
-                lastFrameNs = System.nanoTime();
-                new Thread(GameView.this, "game-loop").start();
+                // Если поток уже жив (например, поверхность пересоздалась) — не запускаем второй
+                if (gameThread == null || !gameThread.isAlive()) {
+                    setRunning(true);
+                    lastFrameNs = System.nanoTime();
+                    gameThread = new Thread(GameView.this, "game-loop");
+                    gameThread.start();
+                } else {
+                    setRunning(true);
+                    lastFrameNs = System.nanoTime();
+                }
             }
-            @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {}
+            @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
+                if (w > 1 && h > 1 && (w != width || h != height)) {
+                    buildGeometry(w, h);
+                    if (state == STATE_PLAYING) restartCurrentLevel();
+                }
+            }
             @Override public void surfaceDestroyed(SurfaceHolder holder) {
                 setRunning(false);
+                if (gameThread != null) {
+                    try {
+                        gameThread.join(1000);
+                    } catch (InterruptedException ignored) {}
+                    gameThread = null;
+                }
             }
         });
         sound = new SoundManager(context);
@@ -129,8 +147,23 @@ public class GameView extends SurfaceView implements Runnable {
         textPaint.setTextAlign(Paint.Align.CENTER);
     }
 
+    private volatile Thread gameThread;
+
     private void setRunning(boolean r) {
         running = r;
+    }
+
+    public long getHighScore() {
+        return highScore;
+    }
+
+    public void setHighScore(long hs) {
+        if (hs > 0) highScore = hs;
+    }
+
+    /** Возобновление после сворачивания: если игра была на паузе и поверхность снова готова — ждём тапа. */
+    public void resumeGame() {
+        // состояние остаётся STATE_PAUSED, тап по экрану продолжит игру
     }
 
     // =====================================================================
@@ -151,6 +184,10 @@ public class GameView extends SurfaceView implements Runnable {
     // =====================================================================
     //  Запуск уровня
     // =====================================================================
+    private void restartCurrentLevel() {
+        startLevel(level);
+    }
+
     private void startLevel(int lvl) {
         chain.clear();
         projectiles.clear();
@@ -210,24 +247,35 @@ public class GameView extends SurfaceView implements Runnable {
     // =====================================================================
     @Override
     public void run() {
-        while (running) {
-            long now = System.nanoTime();
-            float dt = Math.min(0.05f, (now - lastFrameNs) / 1_000_000_000f);
-            lastFrameNs = now;
+        try {
+            while (running) {
+                long now = System.nanoTime();
+                float dt = Math.min(0.05f, (now - lastFrameNs) / 1_000_000_000f);
+                lastFrameNs = now;
 
-            if (state == STATE_PLAYING) {
-                update(dt);
-            }
-
-            Canvas canvas = getHolder().lockCanvas();
-            if (canvas != null) {
-                synchronized (getHolder()) {
-                    draw(canvas, dt);
+                if (state == STATE_PLAYING) {
+                    update(dt);
                 }
-                getHolder().unlockCanvasAndPost(canvas);
-            }
 
-            try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+                Canvas canvas = null;
+                synchronized (getHolder()) {
+                    if (!getHolder().getSurface().isValid()) {
+                        try { Thread.sleep(30); } catch (InterruptedException ignored) {}
+                        continue;
+                    }
+                    canvas = getHolder().lockCanvas();
+                }
+                if (canvas != null) {
+                    synchronized (getHolder()) {
+                        draw(canvas, dt);
+                    }
+                    getHolder().unlockCanvasAndPost(canvas);
+                }
+
+                try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+            }
+        } catch (Throwable t) {
+            android.util.Log.e("BubblePop", "FATAL: падение игрового потока", t);
         }
     }
 
@@ -237,9 +285,15 @@ public class GameView extends SurfaceView implements Runnable {
     private final PointF tmpPoint = new PointF();
 
     private void update(float dt) {
+        GamePath gp = gamePath; // volatile-снимок: защита от гонки с пересборкой геометрии
+        if (gp == null) return;
+        float total = gp.getTotalLength();
+        if (total <= 0f) return;
+
         // Движение цепочки вперёд (к норе)
         for (Ball b : chain) {
             b.dist += chainSpeed * dt;
+            if (Float.isNaN(b.dist) || Float.isInfinite(b.dist)) b.dist = 0f;
         }
 
         // Выпуск новых шариков с хвоста (отрицательный dist -> въезжают за краем)
@@ -330,7 +384,9 @@ public class GameView extends SurfaceView implements Runnable {
         // Решаем, вставлять перед или после ударного шарика — ближе к краю удара
         float dx = p.x - hit.pos.x, dy = p.y - hit.pos.y;
         // касательная пути в точке шарика
-        gamePath.getPoint(hit.dist - 1f, tmpPoint);
+        GamePath gpI = gamePath;
+        if (gpI == null) return;
+        gpI.getPoint(hit.dist - 1f, tmpPoint);
         float tx = hit.pos.x - tmpPoint.x, ty = hit.pos.y - tmpPoint.y;
         float dot = dx * tx + dy * ty;
         int idx = dot >= 0 ? hitIdx + 1 : hitIdx;
@@ -429,9 +485,12 @@ public class GameView extends SurfaceView implements Runnable {
             if (score > highScore) highScore = score;
             state = STATE_GAME_OVER;
         } else {
+            GamePath gp = gamePath;
+            float total = gp != null ? gp.getTotalLength() : 0f;
+            if (Float.isNaN(total) || total <= 0f) total = Math.min(width, height) * 4f;
             // откатываем цепочку назад как в оригинальной Зуме
             for (Ball b : chain) {
-                b.dist -= gamePath.getTotalLength() * 0.25f;
+                b.dist -= total * 0.25f;
             }
         }
     }
@@ -448,10 +507,17 @@ public class GameView extends SurfaceView implements Runnable {
     //  Отрисовка
     // =====================================================================
     private void draw(Canvas canvas, float dt) {
-        if (width == 0 && getWidth() > 0) {
-            buildGeometry(getWidth(), getHeight());
+        // Пересобираем геометрию при каждом изменении размера поверхности.
+        // Это критично на Android 12+: SurfaceView может быть создан с временным
+        // размером 1x1 (или 0), а реальный размер приходит в surfaceChanged.
+        int vw = getWidth(), vh = getHeight();
+        if (vw > 1 && vh > 1 && (vw != width || vh != height)) {
+            buildGeometry(vw, vh);
+            if (state == STATE_PLAYING) restartCurrentLevel();
         }
-        if (width == 0) return;
+        GamePath gp = gamePath;
+        Path tr = track;
+        if (width <= 1 || gp == null || tr == null) return;
 
         // фон-градиент
         drawBackground(canvas);
@@ -468,18 +534,21 @@ public class GameView extends SurfaceView implements Runnable {
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(trackWidth);
         paint.setColor(Color.argb(70, 0, 0, 0));
-        canvas.drawPath(track, paint);
+        canvas.drawPath(tr, paint);
         paint.setStrokeWidth(trackWidth * 0.82f);
         paint.setColor(Color.argb(60, 255, 255, 255));
-        canvas.drawPath(track, paint);
+        canvas.drawPath(tr, paint);
 
         // Нора в конце пути
-        gamePath.getPoint(gamePath.getTotalLength(), tmpPoint);
+        gp.getPoint(gp.getTotalLength(), tmpPoint);
         drawLair(canvas, tmpPoint.x, tmpPoint.y);
 
         // Обновление экранных позиций шариков (нужно и для коллизий)
         for (Ball b : chain) {
-            gamePath.getPoint(b.dist, b.pos);
+            gp.getPoint(b.dist, b.pos);
+            if (Float.isNaN(b.pos.x) || Float.isNaN(b.pos.y)) {
+                b.pos.set(-1000f, -1000f);
+            }
         }
 
         // Шарики (рисуем от хвоста к голове)
