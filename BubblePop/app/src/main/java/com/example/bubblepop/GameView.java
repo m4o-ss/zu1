@@ -862,7 +862,9 @@ public class GameView extends SurfaceView implements Runnable {
     }
 
     public void pauseGame() {
-        if (state == STATE_PLAYING) state = STATE_PAUSED;
+        synchronized (gameLock) {
+            if (state == STATE_PLAYING) state = STATE_PAUSED;
+        }
     }
 
     public void releaseSound() {
